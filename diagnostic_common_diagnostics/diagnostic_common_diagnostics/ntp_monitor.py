@@ -35,81 +35,58 @@
 import socket
 import sys
 import threading
+import traceback
 
 import diagnostic_updater as DIAG
+from diagnostic_updater.diagnostic_updater._diagnostic_updater import Updater
+from diagnostic_msgs.msg import DiagnosticStatus
 import ntplib
 import rclpy
 from rclpy.node import Node
 
 
-class NTPMonitor(Node):
+class NTPTask(DiagnosticTask):
     """A diagnostic task that monitors the NTP offset of the system clock."""
 
-    def __init__(self, ntp_hostname, ntp_port, offset=500, self_offset=500,
-                 diag_hostname=None, error_offset=5000000,
-                 do_self_test=True):
+    def __init__(self, ntp_hostname, ntp_port, warning_offset, error_offset):
         """Initialize the NTPMonitor."""
-        super().__init__(__class__.__name__)
-        self.declare_parameter('frequency', 10.0)
-        frequency = self.get_parameter('frequency').get_parameter_value().double_value
 
-        self.ntp_hostname = ntp_hostname
-        self.ntp_port = ntp_port
-        self.offset = offset
-        self.self_offset = self_offset
-        self.diag_hostname = diag_hostname
-        self.error_offset = error_offset
-        self.do_self_test = do_self_test
+        self._ntp_hostname = ntp_hostname
+        self._ntp_port = ntp_port
+        self._warning_offset = warning_offset
+        self._error_offset = error_offset
 
-        self.hostname = socket.gethostname()
-        if self.diag_hostname is None:
-            self.diag_hostname = self.hostname
+    def run(self, stat):
+        ntp_client = ntplib.NTPClient()
+        response = None
+        exception_msg = ''
+        try:
+            response = ntp_client.request(
+                self.ntp_hostname,
+                port=self.ntp_port,
+                version=3)
+        except ntplib.NTPException as e:
+            exception_msg = str(e)
 
-        self.stat = DIAG.DiagnosticStatus()
-        self.stat.level = DIAG.DiagnosticStatus.OK
-        self.stat.name = 'NTP offset from ' + \
-            self.diag_hostname + ' to ' + self.ntp_hostname + \
-            ':' + str(self.ntp_port)
-        self.stat.message = 'OK'
-        self.stat.hardware_id = self.hostname
-        self.stat.values = []
+        if response is not None:
+            measured_offset = response.offset * 1e6
+            stat.add('NTP offset to ' + self._ntp_hostname + \
+            ':' + str(self._ntp_port), f'{measured_offset:.2f}')
 
-        self.self_stat = DIAG.DiagnosticStatus()
-        self.self_stat.level = DIAG.DiagnosticStatus.OK
-        self.self_stat.name = 'NTP self-offset for ' + self.diag_hostname
-        self.self_stat.message = 'OK'
-        self.self_stat.hardware_id = self.hostname
-        self.self_stat.values = []
-
-        self.mutex = threading.Lock()
-        self.pub = self.create_publisher(
-            DIAG.DiagnosticArray, '/diagnostics', 10)
-
-        # we need to periodically republish this
-        self.current_msg = None
-        self.pubtimer = self.create_timer(1/frequency, self.pubCB)
-        self.checktimer = self.create_timer(1/frequency, self.checkCB)
-
-    def pubCB(self):
-        with self.mutex:
-            if self.current_msg:
-                self.pub.publish(self.current_msg)
-
-    def checkCB(self):
-        new_msg = DIAG.DiagnosticArray()
-        new_msg.header.stamp = self.get_clock().now().to_msg()
-
-        st = self.ntp_diag(self.stat)
-        if st is not None:
-            new_msg.status.append(st)
-
-        if self.do_self_test:
-            st = self.ntp_diag(self.self_stat)
-            if st is not None:
-                new_msg.status.append(st)
-
-        with self.mutex:
-            self.current_msg = new_msg
+            if (abs(measured_offset) > self._error_offset):
+                stat.summary(DiagnosticStatus.ERROR,
+                         f'NTP offset above error threshold: abs({measured_offset})>'\
+                         f'{self._error_offset} us')
+            elif (abs(measured_offset) > self._warning_offset):
+                stat.summary(DiagnosticStatus.WARN,
+                         f'NTP offset above threshold: abs({measured_offset})>'\
+                         f'{self._warning_offset} us')
+            else:
+                stat.summary(DiagnosticStatus.OK,
+                         f'NTP Offset abs({measured_offset}) us')
+        else:
+            stat.summary(DiagnosticStatus.ERROR,
+                         f'NTP Error: {exception_msg}')
 
     def ntp_diag(self, st):
         """Add ntp diagnostics to the given status message `st` and return it."""
@@ -153,66 +130,46 @@ class NTPMonitor(Node):
         return st
 
 
-def ntp_monitor_main(argv=sys.argv[1:]):
-    # filter out ROS args
-    argv = argv[:argv.index('--ros-args')] if '--ros-args' in argv else argv
-
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--ntp_hostname',
-                        action='store', default='0.pool.ntp.org',
-                        type=str)
-    parser.add_argument('--ntp_port',
-                        action='store', default=123,
-                        type=int)
-    parser.add_argument('--offset-tolerance', dest='offset_tol',
-                        action='store', default=500,
-                        help='Offset from NTP host [us]', metavar='OFFSET-TOL',
-                        type=int)
-    parser.add_argument('--error-offset-tolerance', dest='error_offset_tol',
-                        action='store', default=5000000,
-                        help='Offset from NTP host. Above this is error',
-                        metavar='OFFSET-TOL', type=int)
-    parser.add_argument('--self_offset-tolerance', dest='self_offset_tol',
-                        action='store', default=500,
-                        help='Offset from self [us]', metavar='SELF_OFFSET-TOL',
-                        type=int)
-    parser.add_argument('--diag-hostname', dest='diag_hostname',
-                        help='Computer name in diagnostics output (ex: "c1")',
-                        metavar='DIAG_HOSTNAME',
-                        action='store', default=None,
-                        type=str)
-    parser.add_argument('--no-self-test', dest='do_self_test',
-                        help='Disable self test',
-                        action='store_false', default=True)
-    args = parser.parse_args(args=argv)
-
-    offset = args.offset_tol
-    self_offset = args.self_offset_tol
-    error_offset = args.error_offset_tol
-    assert offset < error_offset, \
-        'Offset tolerance must be less than error offset tolerance'
-
-    ntp_monitor = NTPMonitor(args.ntp_hostname, args.ntp_port,
-                             offset, self_offset,
-                             args.diag_hostname, error_offset,
-                             args.do_self_test)
-
-    rclpy.spin(ntp_monitor)
-
-
 def main(args=None):
     rclpy.init(args=args)
-    try:
-        ntp_monitor_main()
-    except KeyboardInterrupt:
-        pass
-    except SystemExit:
-        pass
-    except Exception:
-        import traceback
-        traceback.print_exc()
 
+    # Create the node
+    hostname = socket.gethostname()
+    # Every invalid symbol is replaced by underscore.
+    # isalnum() alone also allows invalid symbols depending on the locale
+    cleaned_hostname = ''.join(
+        c if (c.isascii() and c.isalnum()) else '_' for c in hostname)
+    node = Node(f'ntp_monitor_{cleaned_hostname}')
+
+    # Declare and get parameters
+    node.declare_parameter('ntp_hostname', 'pool.ntp.org')
+    node.declare_parameter('ntp_port', 123)
+    node.declare_parameter('warning_offset_tolerance', 500)
+    node.declare_parameter('error_offset_tolerance', 5000000)
+
+    ntp_hostname = node.get_parameter(
+        'ntp_hostname').get_parameter_value().string_value
+    ntp_port = node.get_parameter(
+        'ntp_port').get_parameter_value().integer_value
+    warning_offset = node.get_parameter(
+        'warning_offset_tolerance').get_parameter_value().integer_value
+    error_offset = node.get_parameter(
+        'error_offset_tolerance').get_parameter_value().integer_value
+
+    # Create diagnostic updater with default updater rate of 1 hz
+    updater = Updater(node)
+    updater.setHardwareID(hostname)
+    updater.add(NTPTask(ntp_hostname=ntp_hostname,
+                        ntp_port=ntp_port,
+                        warning_offset=warning_offset,
+                        error_offset=error_offset))
+
+    rclpy.spin(node)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        traceback.print_exc()
