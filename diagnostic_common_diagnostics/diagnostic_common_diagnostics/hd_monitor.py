@@ -41,16 +41,16 @@ from pathlib import Path
 from shutil import disk_usage
 from socket import gethostname
 from typing import List
+import traceback
 
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from diagnostic_updater import Updater
+from diagnostic_updater.diagnostic_updater._diagnostic_updater import DiagnosticTask
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 import rclpy
 from rclpy.node import Node
 
 
-FREE_PERCENT_LOW = 5
-FREE_PERCENT_CRIT = 1
 DICT_STATUS = {
     DiagnosticStatus.OK: 'OK',
     DiagnosticStatus.WARN: 'Warning',
@@ -63,97 +63,69 @@ DICT_USAGE = {
 }
 
 
-class HDMonitor(Node):
+class HDTask(DiagnosticTask):
     """
-    Diagnostic node checking the remaining space on the specified hard drive.
+    Diagnostic task checking the remaining space on the specified hard drive.
 
-    Three ROS parameters:
-    - path: Path on the filesystem to check (string, default: home directory)
-    - free_percent_low: Percentage at which to consider the space left as low
-    - free_percent_crit: Percentage at which to consider the space left as critical
     """
 
-    def __init__(self):
-        hostname = gethostname()
-        # Every invalid symbol is replaced by underscore.
-        # isalnum() alone also allows invalid symbols depending on the locale
-        cleaned_hostname = ''.join(
-            c if (c.isascii() and c.isalnum()) else '_' for c in hostname)
-        super().__init__(f'hd_monitor_{cleaned_hostname}')
+    def __init__(self, path, warning_percentage, error_percentage):
+        self._path = path
+        self._warning_percentage = warning_percentage
+        self._error_percentage = error_percentage
 
-        self._path = '~'
-        self._free_percent_low = FREE_PERCENT_LOW
-        self._free_percent_crit = FREE_PERCENT_CRIT
+    def run(self, stat):
+        total, used, _ = disk_usage(self._path)
+        percent = used / total * 100.0
 
-        self.add_on_set_parameters_callback(self.callback_config)
-        self.declare_parameter('path', self._path,  ParameterDescriptor(
-            description='Path in which to check remaining space.'))
-        self.declare_parameter(
-            'free_percent_low', self._free_percent_low,  ParameterDescriptor(
-                description='Warning threshold.', type=int()))
-        self.declare_parameter(
-            'free_percent_crit', self._free_percent_crit,  ParameterDescriptor(
-                description='Error threshold.', type=int()))
+        stat.add('HD Path', f'{self._path}')
+        stat.add('HD Total (Gb)', f'{total // (1024 * 1024)}')
+        stat.add('HD Usage (%)', f'{percent:.2f}')
 
-        self._updater = Updater(self)
-        self._updater.setHardwareID(hostname)
-        self._updater.add(f'{hostname} HD Usage', self.check_disk_usage)
-
-    def callback_config(self, params: List[rclpy.Parameter]):
-        """
-        Retrieve ROS parameters.
-
-        see the class documentation for declared parameters.
-        """
-        for param in params:
-            if param.name == 'path':
-                self._path = str(
-                    Path(param.value).expanduser().resolve(strict=True)
-                )
-            elif param.name == 'free_percent_low':
-                self._free_percent_low = param.value
-            elif param.name == 'free_percent_crit':
-                self._free_percent_crit = param.value
-
-        return SetParametersResult(successful=True)
-
-    def check_disk_usage(self, diag: DiagnosticStatus) -> DiagnosticStatus:
-        """
-        Compute the disk usage and derive a status from it.
-
-        Task periodically ran by the diagnostic updater.
-        """
-        diag.level = DiagnosticStatus.OK
-
-        total, _, free = disk_usage(self._path)
-        percent = free / total * 100.0
-
-        if percent > self._free_percent_low:
-            diag.level = DiagnosticStatus.OK
-        elif percent > self._free_percent_crit:
-            diag.level = DiagnosticStatus.WARN
+        if percent >= self._error_percentage:
+            stat.summary(DiagnosticStatus.ERROR,
+                         f'HD usage exceeds {self._error_percentage} percent')
+        elif percent >= self._warning_percentage:
+            stat.summary(DiagnosticStatus.WARN,
+                         f'HD usage exceeds {self._warning_percentage} percent')
         else:
-            diag.level = DiagnosticStatus.ERROR
+            stat.summary(DiagnosticStatus.OK,
+                         f'HD usage {percent:.2f} percent')
 
-        total_go = total // (1024 * 1024)
-        diag.values.extend(
-            [
-                KeyValue(key='Name', value=self._path),
-                KeyValue(key='Status', value=DICT_STATUS[diag.level]),
-                KeyValue(key='Total (Go)', value=str(total_go)),
-                KeyValue(key='Available (%)', value=str(round(percent, 1))),
-            ]
-        )
-
-        diag.message = DICT_USAGE[diag.level]
-        return diag
+        return stat
 
 
 def main(args=None):
     """Run the HDMonitor class."""
     rclpy.init(args=args)
 
-    node = HDMonitor()
+    # Create the node
+    hostname = gethostname()
+    # Every invalid symbol is replaced by underscore.
+    # isalnum() alone also allows invalid symbols depending on the locale
+    cleaned_hostname = ''.join(
+        c if (c.isascii() and c.isalnum()) else '_' for c in hostname)
+    node = Node(f'hd_monitor_{cleaned_hostname}')
+
+    # Declare and get parameters
+    node.declare_parameter('warning_percentage', 90)
+    node.declare_parameter('error_percentage', 99)
+
+    warning_percentage = node.get_parameter(
+        'warning_percentage').get_parameter_value().integer_value
+    error_percentage = node.get_parameter(
+        'error_percentage').get_parameter_value().integer_value
+    path = node.get_parameter('path').get_parameter_value().string_value
+
+    # Create diagnostic updater with default updater rate of 1 hz
+    updater = Updater(node)
+    updater.setHardwareID(hostname)
+    updater.add(HDTask(path=path,
+                        warning_percentage=warning_percentage,
+                        error_percentage=error_percentage))
+
+    rclpy.spin(node)
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -161,4 +133,9 @@ def main(args=None):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        traceback.print_exc()
