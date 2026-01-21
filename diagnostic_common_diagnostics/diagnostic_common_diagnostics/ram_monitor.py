@@ -48,9 +48,17 @@ import rclpy
 
 class RamTask(DiagnosticTask):
 
-    def __init__(self, warning_percentage, window):
+    def __init__(self, warning_percentage, error_percentage, window):
         DiagnosticTask.__init__(self, 'RAM Information')
         self._warning_percentage = int(warning_percentage)
+        self._error_percentage = int(error_percentage)
+        self._logger = rclpy.logging.get_logger('RamTask')
+        if self._warning_percentage > self._error_percentage:
+            self._logger.warn(
+                'warning_percentage should be less than or equal to error_percentage,' \
+                ' adjusting warning_percentage to %d' % self._error_percentage)
+            self._warning_percentage = self._error_percentage
+
         self._readings = collections.deque(maxlen=window)
 
     def run(self, stat):
@@ -59,7 +67,12 @@ class RamTask(DiagnosticTask):
 
         stat.add('RAM Load Average', f'{ram_average:.2f}')
 
-        if ram_average > self._warning_percentage:
+        if ram_average >= self._error_percentage:
+            stat.summary(
+                DiagnosticStatus.ERROR,
+                f'RAM Average exceeds {self._error_percentage:d} percent',
+            )
+        elif ram_average > self._warning_percentage:
             stat.summary(
                 DiagnosticStatus.WARN,
                 f'RAM Average exceeds {self._warning_percentage:d} percent',
@@ -79,12 +92,24 @@ def main():
     rclpy.init()
     node = rclpy.create_node(f'ram_monitor_{cleaned_hostname}')
 
+    # Declare and get parameters
+    node.declare_parameter('warning_percentage', 90)
+    node.declare_parameter('error_percentage', 99)
+    node.declare_parameter('window', 1)
+
+    warning_percentage = node.get_parameter(
+        'warning_percentage').get_parameter_value().integer_value
+    error_percentage = node.get_parameter(
+        'error_percentage').get_parameter_value().integer_value
+    window = node.get_parameter('window').get_parameter_value().integer_value
+
     updater = Updater(node)
     updater.setHardwareID(hostname)
     updater.add(
         RamTask(
-            node.declare_parameter('warning_percentage', 90).value,
-            node.declare_parameter('window', 1).value,
+            warning_percentage=warning_percentage,
+            error_percentage=error_percentage,
+            window=window,
         )
     )
 

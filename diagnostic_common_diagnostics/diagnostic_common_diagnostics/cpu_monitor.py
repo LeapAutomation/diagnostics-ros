@@ -120,7 +120,8 @@ def main(args=None):
     # Create diagnostic updater with default updater rate of 1 hz
     updater = Updater(node)
     updater.setHardwareID(hostname)
-    updater.add(CpuTask(warning_percentage=warning_percentage, error_percentage=error_percentage,
+    updater.add(CpuTask(warning_percentage=warning_percentage,
+                        error_percentage=error_percentage,
                         window=window))
 
     rclpy.spin(node)
